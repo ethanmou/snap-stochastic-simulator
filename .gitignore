@@ -1,0 +1,32 @@
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+
+# Local environment files
+.env
+.env.*
+
+# OS and editor metadata
+.DS_Store
+.idea/
+.vscode/
+
+# Generated reports and data dumps
+*.csv
+*.xlsx
+*.parquet
+*.pkl
