@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "pandas",
+    "matplotlib",
 ]
 
 [project.optional-dependencies]
@@ -19,7 +20,7 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["stochastic_simulation"]
+py-modules = ["stochastic_simulation", "light_simulation", "fluid_steady_state"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -27,6 +27,13 @@ dist/
 
 # Generated reports and data dumps
 *.csv
+!outputs/
+!outputs/*.csv
+!outputs/weekly_research/
+!outputs/weekly_research/*.csv
+!outputs/weekly_research/*.png
+!outputs/weekly_research/*.md
+outputs/weekly_research/.matplotlib/
 *.xlsx
 *.parquet
 *.pkl
