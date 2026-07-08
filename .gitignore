@@ -34,6 +34,10 @@ dist/
 !outputs/weekly_research/*.png
 !outputs/weekly_research/*.md
 outputs/weekly_research/.matplotlib/
+!outputs/nonstationary_attempts/
+!outputs/nonstationary_attempts/*.csv
+!outputs/nonstationary_attempts/*.png
+outputs/nonstationary_attempts/.matplotlib/
 *.xlsx
 *.parquet
 *.pkl

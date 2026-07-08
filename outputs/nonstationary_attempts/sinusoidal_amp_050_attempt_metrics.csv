@@ -1,0 +1,2 @@
+scenario,arrival_amplitude,arrival_period_model_days,mean_attempts_before_enrollment,median_attempts_before_enrollment,p90_attempts_before_enrollment,p95_attempts_before_enrollment,max_attempts_before_enrollment,num_completed_enrollments_with_attempt_records
+sinusoidal_amp_050,0.5,7.0,0.7882124478314526,0.0,2.0,3.0,14,1850732

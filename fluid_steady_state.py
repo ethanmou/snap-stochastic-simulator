@@ -10,6 +10,7 @@ import pandas as pd
 from stochastic_simulation import (
     SimulationParams,
     _validate_params,
+    arrival_rate_at,
 )
 
 
@@ -54,6 +55,8 @@ def solve_fluid_steady_state(params: SimulationParams) -> FluidSteadyStateResult
     """
 
     _validate_params(params)
+    if params.arrival_process != "constant":
+        raise ValueError("fluid steady-state formulas require constant arrivals")
     _validate_fluid_requirements(params)
 
     threshold = params.gamma * params.c * params.mu_plus / (
@@ -98,7 +101,6 @@ def fluid_steady_state(params: SimulationParams) -> FluidSteadyStateResult:
 def fluid_ode_rhs(t: float, y, params: SimulationParams) -> np.ndarray:
     """Return the Section 4.1 fluid ODE right-hand side for y = [q, b, rS, rL]."""
 
-    del t
     _validate_params(params)
     q, b, rS, rL = np.asarray(y, dtype=float)
     mu = params.mu_plus + params.mu_minus
@@ -108,7 +110,7 @@ def fluid_ode_rhs(t: float, y, params: SimulationParams) -> np.ndarray:
 
     return np.array(
         [
-            params.lam
+            arrival_rate_at(t, params)
             + params.deltaB * b
             + params.deltaS * rS
             + params.deltaL * rL

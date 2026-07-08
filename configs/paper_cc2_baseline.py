@@ -17,7 +17,7 @@ class PaperCC2Baseline:
     """Raw and derived baseline values for Call Center #2."""
 
     model_day_minutes: float = MODEL_DAY_MINUTES
-    c: int = 52
+    c: int = 32
     lam: float = 623.3
     aht_minutes: float = 21.9
     p_plus: float = 0.5

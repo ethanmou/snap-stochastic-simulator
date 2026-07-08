@@ -10,6 +10,7 @@ to minutes with ``MINUTES_PER_MODEL_DAY``.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, dataclass, replace
 import math
 from typing import Optional
@@ -83,6 +84,25 @@ class SimulationParams:
     rl0: int = 0
     # Random seed. The same seed produces a reproducible single replication.
     seed: Optional[int] = None
+    # Fresh-arrival process. "constant" preserves the historical lam behavior.
+    arrival_process: str = "constant"
+    # Baseline fresh-arrival rate for non-stationary arrivals; defaults to lam.
+    lambda0: Optional[float] = None
+    # Sinusoidal relative amplitude A in lambda0 * (1 + A sin(...)).
+    arrival_amplitude: float = 0.0
+    # Sinusoidal period in model days, matching the simulator's base time unit.
+    arrival_period: float = 1.0
+    # Sinusoidal phase shift in radians.
+    arrival_phase: float = 0.0
+
+
+@dataclass
+class Caller:
+    """Caller-level state needed for waits and enrollment-attempt counts."""
+
+    queue_entry_time: float
+    service_start_time: float | None = None
+    attempt_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -183,6 +203,18 @@ class SimulationResult:
     total_attempts_per_external_arrival: float
     # Aggregate proxy: redial arrivals divided by all arrivals.
     repeat_attempt_share: float
+    # Mean retry count before successful enrollment; 0 means success on first call.
+    mean_attempts_before_enrollment: float
+    # Median retry count before successful enrollment.
+    median_attempts_before_enrollment: float
+    # 90th percentile retry count before successful enrollment.
+    p90_attempts_before_enrollment: float
+    # 95th percentile retry count before successful enrollment.
+    p95_attempts_before_enrollment: float
+    # Maximum retry count observed before successful enrollment.
+    max_attempts_before_enrollment: int
+    # Number of post-warmup successful enrollments with attempt records.
+    num_completed_enrollments_with_attempt_records: int
 
     def to_dict(self) -> dict[str, int | float]:
         """Return the result as a flat dictionary suitable for a DataFrame row."""
@@ -213,6 +245,9 @@ def _validate_params(params: SimulationParams) -> None:
         "deltaS",
         "deltaL",
         "gamma",
+        "arrival_amplitude",
+        "arrival_period",
+        "arrival_phase",
     )
     for name in real_fields:
         value = getattr(params, name)
@@ -225,10 +260,21 @@ def _validate_params(params: SimulationParams) -> None:
     if params.warmup < 0 or params.warmup >= params.T:
         raise ValueError("warmup must satisfy 0 <= warmup < T")
 
-    # Apart from T and warmup, the real-valued fields are event rates.
-    for name in real_fields[2:]:
+    # Apart from T, warmup, arrival_amplitude, and arrival_phase, real fields are rates.
+    for name in real_fields[2:14]:
         if getattr(params, name) < 0:
             raise ValueError(f"{name} must be nonnegative")
+    if params.lambda0 is not None:
+        if not math.isfinite(params.lambda0):
+            raise ValueError("lambda0 must be finite")
+        if params.lambda0 < 0:
+            raise ValueError("lambda0 must be nonnegative")
+    if params.arrival_process not in ("constant", "sinusoidal"):
+        raise ValueError("arrival_process must be 'constant' or 'sinusoidal'")
+    if params.arrival_amplitude < 0 or params.arrival_amplitude > 1:
+        raise ValueError("arrival_amplitude must satisfy 0 <= amplitude <= 1")
+    if params.arrival_period <= 0:
+        raise ValueError("arrival_period must be positive")
 
     # c, q0, b0, rs0, and rl0 are capacities or population counts.
     integer_fields = ("c", "q0", "b0", "rs0", "rl0")
@@ -251,6 +297,64 @@ def _safe_divide(numerator: float, denominator: float) -> float:
     """Return numerator / denominator, using 0.0 when the denominator is zero."""
 
     return float(numerator / denominator) if denominator != 0 else 0.0
+
+
+def _base_arrival_rate(params: SimulationParams) -> float:
+    """Return lambda0 when supplied, otherwise the historical lam parameter."""
+
+    return params.lam if params.lambda0 is None else params.lambda0
+
+
+def arrival_rate_at(t: float, params: SimulationParams) -> float:
+    """Return the external fresh-arrival rate at time t.
+
+    Time is measured in model days, the same unit used by the simulator. The
+    sinusoidal process models predictable within-horizon load variation around
+    ``lambda0``; ``arrival_amplitude`` is restricted to [0, 1] by validation so
+    the rate is never negative.
+    """
+
+    _validate_params(params)
+    if params.arrival_process == "constant":
+        return float(params.lam)
+    rate = _base_arrival_rate(params) * (
+        1.0
+        + params.arrival_amplitude
+        * math.sin(2.0 * math.pi * t / params.arrival_period + params.arrival_phase)
+    )
+    return float(rate)
+
+
+def arrival_rate_upper_bound(
+    params: SimulationParams, horizon: float | None = None
+) -> float:
+    """Return a dominating fresh-arrival rate for NHPP thinning."""
+
+    del horizon
+    _validate_params(params)
+    if params.arrival_process == "constant":
+        return float(params.lam)
+    return float(_base_arrival_rate(params) * (1.0 + params.arrival_amplitude))
+
+
+def generate_arrival_times(
+    params: SimulationParams, horizon: float, rng: np.random.Generator
+):
+    """Yield fresh-arrival times using Lewis-Shedler thinning for NHPP arrivals."""
+
+    _validate_params(params)
+    if horizon <= 0:
+        raise ValueError("horizon must be positive")
+    lambda_max = arrival_rate_upper_bound(params, horizon)
+    if lambda_max == 0.0:
+        return
+    t = 0.0
+    while t < horizon:
+        t += rng.exponential(1.0 / lambda_max)
+        if t > horizon:
+            break
+        if rng.random() <= arrival_rate_at(t, params) / lambda_max:
+            yield t
 
 
 def sample_event(rates: np.ndarray, total_rate: float, rng: np.random.Generator) -> int:
@@ -309,6 +413,51 @@ def compute_repeat_attempt_proxies(result_or_mapping) -> dict[str, float]:
     }
 
 
+def summarize_attempt_records(records: list[int]) -> dict[str, int | float]:
+    """Summarize completed enrollment attempt counts.
+
+    attempt_count=0 means the caller enrolled on the initial call without a
+    return from a redial orbit during that enrollment episode.
+    """
+
+    if len(records) == 0:
+        return {
+            "mean_attempts_before_enrollment": 0.0,
+            "median_attempts_before_enrollment": 0.0,
+            "p90_attempts_before_enrollment": 0.0,
+            "p95_attempts_before_enrollment": 0.0,
+            "max_attempts_before_enrollment": 0,
+            "num_completed_enrollments_with_attempt_records": 0,
+        }
+    values = np.asarray(records, dtype=float)
+    return {
+        "mean_attempts_before_enrollment": float(np.mean(values)),
+        "median_attempts_before_enrollment": float(np.median(values)),
+        "p90_attempts_before_enrollment": float(np.percentile(values, 90)),
+        "p95_attempts_before_enrollment": float(np.percentile(values, 95)),
+        "max_attempts_before_enrollment": int(np.max(values)),
+        "num_completed_enrollments_with_attempt_records": int(len(records)),
+    }
+
+
+def attempt_distribution_table(records: list[int]) -> pd.DataFrame:
+    """Return attempt_count,num_callers,fraction for completed enrollments."""
+
+    counts = Counter(records)
+    total = sum(counts.values())
+    rows = []
+    for attempt_count in sorted(counts):
+        num_callers = counts[attempt_count]
+        rows.append(
+            {
+                "attempt_count": attempt_count,
+                "num_callers": num_callers,
+                "fraction": _safe_divide(num_callers, total),
+            }
+        )
+    return pd.DataFrame(rows, columns=["attempt_count", "num_callers", "fraction"])
+
+
 def _validate_simulation_state(
     *,
     t: float,
@@ -358,7 +507,18 @@ def _validate_simulation_state(
             raise ValueError(f"{prefix}: total_rate must be positive before sampling")
 
 
-def simulate_one(params: SimulationParams, validate: bool = False) -> SimulationResult:
+def simulate_one(
+    params: SimulationParams,
+    validate: bool = False,
+    return_attempt_records: bool = False,
+    record_path: bool = False,
+    record_dt: float | None = None,
+) -> (
+    SimulationResult
+    | tuple[SimulationResult, list[int]]
+    | tuple[SimulationResult, pd.DataFrame]
+    | tuple[SimulationResult, list[int], pd.DataFrame]
+):
     """Run one Gillespie simulation of the SNAP call center model.
 
     Time averages and event statistics are collected after ``params.warmup``.
@@ -373,14 +533,20 @@ def simulate_one(params: SimulationParams, validate: bool = False) -> Simulation
 
     # B, RS, and RL are external pools that can generate future calls.
     B = params.b0
-    RS = params.rs0
-    RL = params.rl0
+    short_orbit = Counter({0: params.rs0}) if params.rs0 > 0 else Counter()
+    long_orbit = Counter({0: params.rl0}) if params.rl0 > 0 else Counter()
     # Up to c initial callers enter service immediately; the rest wait in queue.
     initial_in_service = min(params.q0, params.c)
-    # in_service stores the service start time for each caller currently in service.
-    in_service = [0.0] * initial_in_service
-    # waiting_queue stores each waiting caller's queue entry time for wait metrics.
-    waiting_queue = [0.0] * (params.q0 - initial_in_service)
+    # in_service stores caller records for callers currently being served.
+    in_service = [
+        Caller(queue_entry_time=0.0, service_start_time=0.0, attempt_count=0)
+        for _ in range(initial_in_service)
+    ]
+    # waiting_queue is FIFO and stores caller records for callers waiting.
+    waiting_queue = [
+        Caller(queue_entry_time=0.0, attempt_count=0)
+        for _ in range(params.q0 - initial_in_service)
+    ]
 
     # counts records discrete event counts after warmup.
     counts = {
@@ -398,6 +564,8 @@ def simulate_one(params: SimulationParams, validate: bool = False) -> Simulation
     answered_waits: list[float] = []
     # abandoned_waits stores waits for callers who eventually abandon.
     abandoned_waits: list[float] = []
+    # Completed enrollment episode attempt records, collected after warmup.
+    completed_attempt_records: list[int] = []
     # areas accumulates state-time integrals used to compute time averages.
     areas = {
         "Q": 0.0,
@@ -411,41 +579,81 @@ def simulate_one(params: SimulationParams, validate: bool = False) -> Simulation
     # These min/max diagnostics help detect violations of state constraints.
     min_Q = params.q0
     min_B = B
-    min_RS = RS
-    min_RL = RL
+    min_RS = sum(short_orbit.values())
+    min_RL = sum(long_orbit.values())
     max_in_service = len(in_service)
     # Current simulation clock.
     t = 0.0
+    path_rows: list[dict[str, float | int]] = []
+    if record_path:
+        if record_dt is None:
+            record_dt = params.T / 500.0
+        if record_dt <= 0 or not math.isfinite(record_dt):
+            raise ValueError("record_dt must be positive and finite")
+        next_record_t = 0.0
+    if params.arrival_process == "sinusoidal":
+        fresh_arrival_times = list(generate_arrival_times(params, params.T, rng))
+    else:
+        fresh_arrival_times = []
+    next_fresh_index = 0
 
-    def admit_caller(entry_time: float, event_time: float, collect: bool) -> None:
+    def orbit_count(orbit: Counter[int]) -> int:
+        """Return the number of callers currently held in an orbit."""
+
+        return int(sum(orbit.values()))
+
+    def pop_orbit_attempt_count(orbit: Counter[int]) -> int:
+        """Sample and remove one caller attempt-count bucket from an orbit.
+
+        TODO: This samples proportionally by attempt-count buckets because the
+        model has aggregate exponential return clocks for each orbit.
+        """
+
+        total = orbit_count(orbit)
+        draw = int(rng.integers(total))
+        cumulative = 0
+        for attempt_count in sorted(orbit):
+            cumulative += orbit[attempt_count]
+            if draw < cumulative:
+                orbit[attempt_count] -= 1
+                if orbit[attempt_count] == 0:
+                    del orbit[attempt_count]
+                return attempt_count
+        raise RuntimeError("failed to sample orbit attempt count")
+
+    def admit_caller(caller: Caller, event_time: float, collect: bool) -> None:
         """Put an arriving caller into service if possible, otherwise queue it.
 
-        entry_time is when the caller entered the current queue; event_time is
-        the current event time. Their difference is the caller's wait. For a
-        fresh arrival they are usually equal, while callers moving from queue
-        to service keep their earlier entry_time.
+        caller.queue_entry_time is when the caller entered the current queue.
+        event_time is the current event time. Their difference is the caller's
+        wait. Fresh arrivals and orbit returns usually enter with queue entry
+        time equal to the current event time.
         """
 
         if len(in_service) < params.c:
-            in_service.append(event_time)
+            caller.service_start_time = event_time
+            in_service.append(caller)
             if collect:
-                answered_waits.append(event_time - entry_time)
+                answered_waits.append(event_time - caller.queue_entry_time)
         else:
-            waiting_queue.append(entry_time)
+            waiting_queue.append(caller)
 
     def start_next_waiting(event_time: float, collect: bool) -> None:
         """Move the earliest waiting caller into service after a server frees up."""
 
         if len(waiting_queue) > 0 and len(in_service) < params.c:
-            entry_time = waiting_queue.pop(0)
-            in_service.append(event_time)
+            caller = waiting_queue.pop(0)
+            caller.service_start_time = event_time
+            in_service.append(caller)
             if collect:
-                answered_waits.append(event_time - entry_time)
+                answered_waits.append(event_time - caller.queue_entry_time)
 
     while t < params.T:
         # Current waiting and service counts determine all event rates in this step.
         n_waiting = len(waiting_queue)
         n_service = len(in_service)
+        RS = orbit_count(short_orbit)
+        RL = orbit_count(long_orbit)
         # Each rates entry corresponds to one possible event:
         # 0 fresh arrival;
         # 1 recertification arrival generated by B;
@@ -459,7 +667,7 @@ def simulate_one(params: SimulationParams, validate: bool = False) -> Simulation
         # 9 natural departure from pool B.
         rates = np.array(
             [
-                params.lam,
+                params.lam if params.arrival_process == "constant" else 0.0,
                 params.deltaB * B,
                 params.deltaS * RS,
                 params.deltaL * RL,
@@ -489,13 +697,31 @@ def simulate_one(params: SimulationParams, validate: bool = False) -> Simulation
                 require_positive_total_rate=total_rate > 0.0,
             )
         # Exponential waiting times are the standard CTMC/Gillespie simulation step.
-        event_time = (
+        endogenous_event_time = (
             params.T
             if total_rate == 0.0
             else t + rng.exponential(1.0 / total_rate)
         )
+        next_fresh_time = (
+            fresh_arrival_times[next_fresh_index]
+            if next_fresh_index < len(fresh_arrival_times)
+            else math.inf
+        )
+        event_time = min(endogenous_event_time, next_fresh_time)
         # If the next event exceeds T, accumulate state integrals only up to T.
         interval_end = min(event_time, params.T)
+        if record_path:
+            while next_record_t <= interval_end:
+                path_rows.append(
+                    {
+                        "t": next_record_t,
+                        "Q": n_waiting + n_service,
+                        "B": B,
+                        "RS": RS,
+                        "RL": RL,
+                    }
+                )
+                next_record_t += float(record_dt)
 
         # Accumulate time averages only after warmup; earlier time only evolves state.
         observed_start = max(t, params.warmup)
@@ -509,71 +735,97 @@ def simulate_one(params: SimulationParams, validate: bool = False) -> Simulation
             areas["busy"] += n_service * observed_dt
 
         # Stop if no event can occur or if the next event is beyond the horizon.
-        if event_time > params.T or total_rate == 0.0:
+        fresh_event_due = (
+            params.arrival_process == "sinusoidal"
+            and next_fresh_index < len(fresh_arrival_times)
+            and next_fresh_time <= endogenous_event_time
+            and next_fresh_time < params.T
+        )
+        endogenous_event_due = (
+            endogenous_event_time <= next_fresh_time
+            and endogenous_event_time < params.T
+            and total_rate > 0.0
+        )
+        if not fresh_event_due and not endogenous_event_due:
             t = params.T
             break
 
         t = event_time
         # collect controls whether the current event enters post-warmup statistics.
         collect = t >= params.warmup
-        # Sample from cumulative rate intervals; the draw is always in [0, total_rate).
-        event = sample_event(rates, total_rate, rng)
+        if fresh_event_due:
+            event = 0
+            next_fresh_index += 1
+        else:
+            # Sample from cumulative rate intervals; the draw is always in [0, total_rate).
+            event = sample_event(rates, total_rate, rng)
 
         if event == 0:  # Fresh arrival
             # External fresh arrival enters the system without changing B, RS, or RL.
             if collect:
                 counts["fresh_arrivals"] += 1
-            admit_caller(t, t, collect)
+            admit_caller(Caller(queue_entry_time=t, attempt_count=0), t, collect)
         elif event == 1:  # Recertification arrival
             # One individual in B generates a recertification call and leaves B.
             B -= 1
             if collect:
                 counts["recertification_arrivals"] += 1
-            admit_caller(t, t, collect)
+            admit_caller(Caller(queue_entry_time=t, attempt_count=0), t, collect)
         elif event == 2:  # Short-redial arrival
             # One short-redial individual returns, leaves RS, and enters the system.
-            RS -= 1
+            attempt_count = pop_orbit_attempt_count(short_orbit)
             if collect:
                 counts["short_redial_arrivals"] += 1
-            admit_caller(t, t, collect)
+            admit_caller(
+                Caller(queue_entry_time=t, attempt_count=attempt_count + 1),
+                t,
+                collect,
+            )
         elif event == 3:  # Long-redial arrival
             # One long-redial individual returns, leaves RL, and enters the system.
-            RL -= 1
+            attempt_count = pop_orbit_attempt_count(long_orbit)
             if collect:
                 counts["long_redial_arrivals"] += 1
-            admit_caller(t, t, collect)
+            admit_caller(
+                Caller(queue_entry_time=t, attempt_count=attempt_count + 1),
+                t,
+                collect,
+            )
         elif event in (4, 5, 6):  # Waiting-caller abandonment
             # Waiting callers have identical clocks, so choose the abandoner uniformly.
             abandoned_index = int(rng.integers(len(waiting_queue)))
-            entry_time = waiting_queue.pop(abandoned_index)
+            caller = waiting_queue.pop(abandoned_index)
             if collect:
-                abandoned_waits.append(t - entry_time)
+                abandoned_waits.append(t - caller.queue_entry_time)
             if event == 4:
                 # Lost abandonment: the caller does not enter any redial pool.
                 if collect:
                     counts["abandon_lost"] += 1
             elif event == 5:
                 # Short redial: the caller may return later at aggregate rate deltaS * RS.
-                RS += 1
+                short_orbit[caller.attempt_count] += 1
                 if collect:
                     counts["abandon_short"] += 1
             else:
                 # Long redial: the caller may return later at aggregate rate deltaL * RL.
-                RL += 1
+                long_orbit[caller.attempt_count] += 1
                 if collect:
                     counts["abandon_long"] += 1
         elif event in (7, 8):  # Service completion
             # In-service callers have identical clocks, so choose the completer uniformly.
             completed_index = int(rng.integers(len(in_service)))
-            in_service.pop(completed_index)
+            caller = in_service.pop(completed_index)
             if event == 7:
                 # Successful service: the individual enters B.
+                if collect:
+                    completed_attempt_records.append(caller.attempt_count)
+                caller.attempt_count = 0
                 B += 1
                 if collect:
                     counts["service_successes"] += 1
             else:
                 # Failed service: the individual enters the long-redial pool RL.
-                RL += 1
+                long_orbit[caller.attempt_count] += 1
                 if collect:
                     counts["service_failures"] += 1
             # When a server frees up, admit the next waiting caller under FCFS.
@@ -584,6 +836,8 @@ def simulate_one(params: SimulationParams, validate: bool = False) -> Simulation
 
         # Update diagnostics after each event to check nonnegativity and capacity.
         Q = len(waiting_queue) + len(in_service)
+        RS = orbit_count(short_orbit)
+        RL = orbit_count(long_orbit)
         min_Q = min(min_Q, Q)
         min_B = min(min_B, B)
         min_RS = min(min_RS, RS)
@@ -641,9 +895,12 @@ def simulate_one(params: SimulationParams, validate: bool = False) -> Simulation
         "total_abandonments": total_abandonments,
     }
     repeat_attempt_proxies = compute_repeat_attempt_proxies(result_values)
+    attempt_summary = summarize_attempt_records(completed_attempt_records)
+    final_RS = orbit_count(short_orbit)
+    final_RL = orbit_count(long_orbit)
 
     # Package event counts, time averages, wait metrics, and diagnostics.
-    return SimulationResult(
+    result = SimulationResult(
         total_arrivals=total_arrivals,
         fresh_arrivals=counts["fresh_arrivals"],
         recertification_arrivals=counts["recertification_arrivals"],
@@ -683,15 +940,24 @@ def simulate_one(params: SimulationParams, validate: bool = False) -> Simulation
         final_waiting=len(waiting_queue),
         final_in_service=len(in_service),
         final_B=B,
-        final_RS=RS,
-        final_RL=RL,
+        final_RS=final_RS,
+        final_RL=final_RL,
         min_Q=min_Q,
         min_B=min_B,
         min_RS=min_RS,
         min_RL=min_RL,
         max_in_service=max_in_service,
         **repeat_attempt_proxies,
+        **attempt_summary,
     )
+    if record_path:
+        path = pd.DataFrame(path_rows, columns=["t", "Q", "B", "RS", "RL"])
+        if return_attempt_records:
+            return result, completed_attempt_records, path
+        return result, path
+    if return_attempt_records:
+        return result, completed_attempt_records
+    return result
 
 
 def run_replications(

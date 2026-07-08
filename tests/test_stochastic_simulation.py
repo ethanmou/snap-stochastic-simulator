@@ -14,7 +14,9 @@ from fluid_steady_state import FluidSteadyStateResult, fluid_ode_rhs
 from fluid_steady_state import solve_fluid_ode, solve_fluid_steady_state
 from light_simulation import LightState, run_light_replications, simulate_light
 from stochastic_simulation import SimulationParams, run_replications, simulate_one
-from stochastic_simulation import compute_repeat_attempt_proxies, sample_event
+from stochastic_simulation import arrival_rate_at, arrival_rate_upper_bound
+from stochastic_simulation import compute_repeat_attempt_proxies, generate_arrival_times
+from stochastic_simulation import sample_event
 
 
 def make_params(**overrides):
@@ -212,6 +214,128 @@ def test_event_sampling_stays_in_range():
         event = sample_event(rates, total_rate, rng)
         assert 0 <= event < len(rates)
         assert rates[event] > 0
+
+
+def test_arrival_rate_at_returns_constant_baseline_rate():
+    params = make_params(lam=12.5, arrival_process="constant")
+
+    assert arrival_rate_at(0.0, params) == pytest.approx(12.5)
+    assert arrival_rate_at(3.7, params) == pytest.approx(12.5)
+
+
+def test_sinusoidal_arrival_rate_is_nonnegative():
+    params = make_params(
+        lam=10.0,
+        arrival_process="sinusoidal",
+        lambda0=10.0,
+        arrival_amplitude=0.5,
+        arrival_period=2.0,
+        arrival_phase=0.0,
+    )
+    values = [arrival_rate_at(t, params) for t in np.linspace(0.0, 4.0, 41)]
+
+    assert min(values) >= 0.0
+
+
+def test_arrival_rate_upper_bound_dominates_sampled_rates():
+    params = make_params(
+        lam=10.0,
+        arrival_process="sinusoidal",
+        lambda0=10.0,
+        arrival_amplitude=0.5,
+        arrival_period=7.0,
+    )
+    upper_bound = arrival_rate_upper_bound(params)
+
+    for t in np.linspace(0.0, params.T, 101):
+        assert upper_bound >= arrival_rate_at(t, params)
+
+
+def test_nhpp_thinning_has_more_high_period_arrivals_than_low_period_arrivals():
+    params = make_params(
+        T=20.0,
+        lam=200.0,
+        arrival_process="sinusoidal",
+        lambda0=200.0,
+        arrival_amplitude=0.9,
+        arrival_period=2.0,
+        arrival_phase=-np.pi / 2.0,
+    )
+    arrivals = list(generate_arrival_times(params, params.T, np.random.default_rng(123)))
+    phases = np.mod(arrivals, params.arrival_period)
+    high = sum(0.75 <= phase <= 1.25 for phase in phases)
+    low = sum(phase <= 0.25 or phase >= 1.75 for phase in phases)
+
+    assert high > low
+
+
+def test_attempt_count_increments_after_short_redial_return():
+    params = make_params(
+        T=2.0,
+        warmup=0.0,
+        c=1,
+        lam=0.0,
+        mu_plus=50.0,
+        mu_minus=0.0,
+        thetaA=0.0,
+        thetaS=0.0,
+        thetaL=0.0,
+        deltaB=0.0,
+        deltaS=50.0,
+        deltaL=0.0,
+        gamma=0.0,
+        b0=0,
+        rs0=1,
+        rl0=0,
+        seed=123,
+    )
+    result, records = simulate_one(params, return_attempt_records=True, validate=True)
+
+    assert records
+    assert min(records) >= 1
+    assert result.mean_attempts_before_enrollment >= 1.0
+
+
+def test_attempt_count_recorded_before_reset_and_recertification_starts_new_episode():
+    params = make_params(
+        T=5.0,
+        warmup=0.0,
+        c=1,
+        lam=0.0,
+        mu_plus=80.0,
+        mu_minus=0.0,
+        thetaA=0.0,
+        thetaS=0.0,
+        thetaL=0.0,
+        deltaB=80.0,
+        deltaS=0.0,
+        deltaL=0.0,
+        gamma=0.0,
+        q0=1,
+        b0=0,
+        rs0=0,
+        rl0=0,
+        seed=456,
+    )
+    result, records = simulate_one(params, return_attempt_records=True, validate=True)
+
+    assert len(records) >= 2
+    assert records[:2] == [0, 0]
+    assert result.num_completed_enrollments_with_attempt_records == len(records)
+
+
+def test_result_row_contains_attempt_metric_columns():
+    result = simulate_one(make_params(seed=321))
+    frame = pd.DataFrame([result.to_dict()])
+
+    assert {
+        "mean_attempts_before_enrollment",
+        "median_attempts_before_enrollment",
+        "p90_attempts_before_enrollment",
+        "p95_attempts_before_enrollment",
+        "max_attempts_before_enrollment",
+        "num_completed_enrollments_with_attempt_records",
+    }.issubset(frame.columns)
 
 
 def test_full_and_light_core_outputs_match_for_same_seed():
