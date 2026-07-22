@@ -338,6 +338,99 @@ def test_result_row_contains_attempt_metric_columns():
     }.issubset(frame.columns)
 
 
+def test_caller_level_records_satisfy_cohort_invariants():
+    params = make_params(
+        T=6.0,
+        warmup=1.0,
+        c=4,
+        lam=12.0,
+        mu_plus=10.0,
+        mu_minus=1.0,
+        thetaA=0.2,
+        thetaS=0.5,
+        thetaL=0.2,
+        deltaB=0.0,
+        deltaS=2.0,
+        deltaL=1.0,
+        gamma=0.0,
+        b0=0,
+        rs0=0,
+        rl0=0,
+        seed=20260708,
+    )
+    result, extras = simulate_one(
+        params,
+        validate=True,
+        return_caller_records=True,
+        return_end_state_distribution=True,
+        return_cohort_summary=True,
+        cohort_start=1.0,
+        cohort_end=4.0,
+    )
+
+    assert result.total_arrivals > 0
+    records = extras["caller_records"]
+    unfinished = extras["unfinished_cohort_callers"]
+    summary = extras["cohort_summary"].iloc[0]
+
+    assert records["caller_id"].is_unique
+    assert (records["first_arrival_time"] <= records["completion_time"]).all()
+    assert records["time_to_enrollment"].ge(0.0).all()
+    assert records["attempt_count"].ge(0).all()
+    expected_cohort = (records["first_arrival_time"] >= 1.0) & (
+        records["first_arrival_time"] < 4.0
+    )
+    assert records["cohort_member"].equals(expected_cohort)
+
+    total = int(summary["number_of_cohort_callers"])
+    completed = int(summary["number_of_completed_cohort_callers"])
+    assert total == completed + len(unfinished)
+    assert "time_in_system" in unfinished.columns
+    assert "time_in_system_so_far" not in unfinished.columns
+    if len(unfinished) > 0:
+        assert unfinished["time_in_system"].ge(0.0).all()
+        assert (
+            unfinished["time_in_system"]
+            <= params.T - unfinished["first_arrival_time"]
+        ).all()
+    if total > 0:
+        assert summary["cohort_completion_rate"] == pytest.approx(completed / total)
+
+
+def test_end_state_attempt_distribution_counts_current_callers():
+    params = make_params(
+        T=2.0,
+        warmup=0.0,
+        c=1,
+        lam=40.0,
+        mu_plus=0.5,
+        mu_minus=0.5,
+        thetaA=0.0,
+        thetaS=2.0,
+        thetaL=1.0,
+        deltaB=0.0,
+        deltaS=0.5,
+        deltaL=0.5,
+        gamma=0.0,
+        b0=0,
+        rs0=0,
+        rl0=0,
+        seed=20260709,
+    )
+    result, extras = simulate_one(
+        params,
+        validate=True,
+        return_end_state_distribution=True,
+        cohort_start=0.5,
+        cohort_end=1.5,
+    )
+
+    distribution = extras["end_state_attempt_distribution"]
+    assert distribution["attempt_count"].ge(0).all()
+    expected = result.final_waiting + result.final_in_service + result.final_RS + result.final_RL
+    assert int(distribution["count"].sum()) == expected
+
+
 def test_full_and_light_core_outputs_match_for_same_seed():
     params = make_params(
         T=8.0,

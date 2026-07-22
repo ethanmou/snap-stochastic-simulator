@@ -1,0 +1,43 @@
+\documentclass{article}
+\usepackage[margin=0.75in,landscape]{geometry}
+\usepackage{booktabs}
+
+\begin{document}
+
+\begin{table}[t!]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}cccccccccccccc@{}}
+\toprule
+CC & $\lambda$ & observed $\hat{\lambda}$ & $c$ & preset AHT & AHT used & enroll \% & $\mu_+$ & $\mu_-$ & $\theta_A$ & $\theta_S$ & $\theta_L$ & $\bar{\theta}$ & abandon time \\
+ &  &  &  & (min) & (min) &  &  &  &  &  &  &  & (min) \\
+\midrule
+1 & 145.4 & 228.0 & 32.5 & 20.8 & 20 & 50 & 13.50 & 13.50 & 21.6 & 16.2 & 16.2 & 54 & 10.0 \\
+2 & 623.3 & 2931.5 & 52.0 & 21.9 & 20 & 50 & 13.50 & 13.50 & 4.0 & 3.0 & 3.0 & 10 & 54.0 \\
+3 & 700.1 & 2396.5 & 72.0 & 44.2 & 40 & 50 & 6.75 & 6.75 & 4.0 & 3.0 & 3.0 & 10 & 54.0 \\
+4 & 164.8 & 712.0 & 51.0 & 44.8 & 40 & 50 & 6.75 & 6.75 & 21.6 & 16.2 & 16.2 & 54 & 10.0 \\
+\bottomrule
+\end{tabular}
+\caption{Call center preset parameters used by the dashboard. All rates are per 540-minute model day. The dashboard computes $\mu_+ + \mu_- = 540/\mathrm{AHT}$ using the nearest available AHT menu value, then sets $\mu_+ = (\mathrm{enroll\%}/100)(\mu_+ + \mu_-)$ and $\mu_- = \mu_+ + \mu_- - \mu_+$. The theta columns use the default balanced theta scenario for each preset.}
+\label{tab:call-center-parameters}
+\end{table}
+
+\begin{table}[t!]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Parameter & Value & Interpretation \\
+\midrule
+$\delta_B$ & $1/130 = 0.007692$ & Recertification rate \\
+$\delta_S$ & $3.0$ & Short-orbit callback rate, one callback every 3 hours \\
+$\delta_L$ & $1/9 = 0.111111$ & Long-orbit callback rate, one callback every 9 days \\
+$\gamma$ & $1/260 = 0.003846$ & Benefit loss rate \\
+\bottomrule
+\end{tabular}
+\caption{Fixed parameters shared across call center presets.}
+\label{tab:call-center-fixed-parameters}
+\end{table}
+
+\end{document}

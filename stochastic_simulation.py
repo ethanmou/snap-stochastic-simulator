@@ -101,8 +101,29 @@ class Caller:
     """Caller-level state needed for waits and enrollment-attempt counts."""
 
     queue_entry_time: float
+    caller_id: int = -1
+    first_arrival_time: float | None = None
     service_start_time: float | None = None
+    completion_time: float | None = None
+    exit_time: float | None = None
     attempt_count: int = 0
+    source_type: str = "fresh"
+    current_location: str = "queue"
+
+    def __post_init__(self) -> None:
+        if self.first_arrival_time is None:
+            self.first_arrival_time = self.queue_entry_time
+
+    def is_cohort_member(
+        self, cohort_start: float | None, cohort_end: float | None
+    ) -> bool:
+        """Return whether this caller's first arrival lies in the target cohort."""
+
+        return (
+            cohort_start is not None
+            and cohort_end is not None
+            and cohort_start <= float(self.first_arrival_time) < cohort_end
+        )
 
 
 @dataclass(frozen=True)
@@ -458,6 +479,102 @@ def attempt_distribution_table(records: list[int]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["attempt_count", "num_callers", "fraction"])
 
 
+def _numeric_summary(values: list[float]) -> dict[str, float]:
+    """Return mean, median, p90, p95, and max with NaNs for empty input."""
+
+    if len(values) == 0:
+        return {
+            "mean": float("nan"),
+            "median": float("nan"),
+            "p90": float("nan"),
+            "p95": float("nan"),
+            "max": float("nan"),
+        }
+    array = np.asarray(values, dtype=float)
+    return {
+        "mean": float(np.mean(array)),
+        "median": float(np.median(array)),
+        "p90": float(np.percentile(array, 90)),
+        "p95": float(np.percentile(array, 95)),
+        "max": float(np.max(array)),
+    }
+
+
+def cohort_summary_table(
+    caller_records: pd.DataFrame,
+    unfinished_callers: pd.DataFrame,
+    *,
+    cohort_start: float | None,
+    cohort_end: float | None,
+    horizon: float,
+) -> pd.DataFrame:
+    """Summarize completion and burden metrics for one first-arrival cohort."""
+
+    if cohort_start is None or cohort_end is None:
+        number_of_cohort_callers = 0
+        completed = caller_records.iloc[0:0]
+    else:
+        completed = caller_records[caller_records["cohort_member"]]
+        number_of_cohort_callers = int(len(completed) + len(unfinished_callers))
+    number_of_completed = int(len(completed))
+    number_of_unfinished = int(number_of_cohort_callers - number_of_completed)
+    attempt_stats = _numeric_summary(completed["attempt_count"].tolist())
+    time_stats = _numeric_summary(completed["time_to_enrollment"].tolist())
+
+    return pd.DataFrame(
+        [
+            {
+                "cohort_start": cohort_start,
+                "cohort_end": cohort_end,
+                "horizon": horizon,
+                "number_of_cohort_callers": number_of_cohort_callers,
+                "number_of_completed_cohort_callers": number_of_completed,
+                "number_of_unfinished_cohort_callers": number_of_unfinished,
+                "cohort_completion_rate": (
+                    number_of_completed / number_of_cohort_callers
+                    if number_of_cohort_callers > 0
+                    else float("nan")
+                ),
+                "mean_attempts": attempt_stats["mean"],
+                "median_attempts": attempt_stats["median"],
+                "p90_attempts": attempt_stats["p90"],
+                "p95_attempts": attempt_stats["p95"],
+                "mean_time_to_enrollment": time_stats["mean"],
+                "median_time_to_enrollment": time_stats["median"],
+                "p90_time_to_enrollment": time_stats["p90"],
+                "p95_time_to_enrollment": time_stats["p95"],
+            }
+        ]
+    )
+
+
+def caller_attempt_distribution_table(caller_records: pd.DataFrame) -> pd.DataFrame:
+    """Return attempt_count,count,proportion for caller-level records."""
+
+    if len(caller_records) == 0:
+        return pd.DataFrame(columns=["attempt_count", "count", "proportion"])
+    counts = Counter(int(value) for value in caller_records["attempt_count"])
+    total = sum(counts.values())
+    return pd.DataFrame(
+        [
+            {
+                "attempt_count": attempt_count,
+                "count": count,
+                "proportion": _safe_divide(count, total),
+            }
+            for attempt_count, count in sorted(counts.items())
+        ],
+        columns=["attempt_count", "count", "proportion"],
+    )
+
+
+def time_to_enrollment_summary_table(caller_records: pd.DataFrame) -> pd.DataFrame:
+    """Return mean, median, p90, p95, and max time-to-enrollment for records."""
+
+    stats = _numeric_summary(caller_records["time_to_enrollment"].tolist())
+    return pd.DataFrame([stats], columns=["mean", "median", "p90", "p95", "max"])
+
+
 def _validate_simulation_state(
     *,
     t: float,
@@ -511,6 +628,15 @@ def simulate_one(
     params: SimulationParams,
     validate: bool = False,
     return_attempt_records: bool = False,
+    return_caller_records: bool = False,
+    return_end_state_distribution: bool = False,
+    return_cohort_summary: bool = False,
+    cohort_start: float | None = None,
+    cohort_end: float | None = None,
+    dynamic_horizon: bool = False,
+    post_clearance_buffer: float = 20.0,
+    max_dynamic_horizon: float | None = None,
+    max_events: int | None = None,
     record_path: bool = False,
     record_dt: float | None = None,
 ) -> (
@@ -528,23 +654,112 @@ def simulate_one(
     """
 
     _validate_params(params)
+    if (cohort_start is None) != (cohort_end is None):
+        raise ValueError("cohort_start and cohort_end must be provided together")
+    if cohort_start is not None and cohort_end is not None:
+        if not math.isfinite(cohort_start) or not math.isfinite(cohort_end):
+            raise ValueError("cohort_start and cohort_end must be finite")
+        if cohort_start >= cohort_end:
+            raise ValueError("cohort_start must be less than cohort_end")
+    if dynamic_horizon:
+        if cohort_start is None or cohort_end is None:
+            raise ValueError("dynamic_horizon requires cohort_start and cohort_end")
+        if not math.isfinite(post_clearance_buffer) or post_clearance_buffer < 0:
+            raise ValueError("post_clearance_buffer must be finite and nonnegative")
+        if max_dynamic_horizon is not None:
+            if not math.isfinite(max_dynamic_horizon) or max_dynamic_horizon <= 0:
+                raise ValueError("max_dynamic_horizon must be positive and finite")
+            if max_dynamic_horizon <= cohort_end:
+                raise ValueError("max_dynamic_horizon must be greater than cohort_end")
+        if max_events is not None:
+            if not isinstance(max_events, (int, np.integer)) or isinstance(
+                max_events, bool
+            ):
+                raise ValueError("max_events must be an integer or None")
+            if max_events <= 0:
+                raise ValueError("max_events must be positive")
+    simulation_limit = (
+        float(max_dynamic_horizon)
+        if dynamic_horizon and max_dynamic_horizon is not None
+        else float(params.T)
+    )
     # NumPy's Generator is the model's only randomness source, aiding reproducibility.
     rng = np.random.default_rng(params.seed)
 
     # B, RS, and RL are external pools that can generate future calls.
     B = params.b0
-    short_orbit = Counter({0: params.rs0}) if params.rs0 > 0 else Counter()
-    long_orbit = Counter({0: params.rl0}) if params.rl0 > 0 else Counter()
+    next_caller_id = 0
+    all_callers: dict[int, Caller] = {}
+    completed_caller_records: list[dict[str, int | float | bool]] = []
+    cohort_size_collected = 0
+    cohort_unfinished_live = 0
+
+    def make_caller(
+        *,
+        event_time: float,
+        source_type: str,
+        attempt_count: int = 0,
+        location: str = "queue",
+    ) -> Caller:
+        """Create and register a caller/person entering the tracked system."""
+
+        nonlocal next_caller_id
+        nonlocal cohort_size_collected, cohort_unfinished_live
+        caller = Caller(
+            queue_entry_time=event_time,
+            caller_id=next_caller_id,
+            first_arrival_time=event_time,
+            attempt_count=attempt_count,
+            source_type=source_type,
+            current_location=location,
+        )
+        all_callers[caller.caller_id] = caller
+        if caller.is_cohort_member(cohort_start, cohort_end):
+            cohort_size_collected += 1
+            cohort_unfinished_live += 1
+        next_caller_id += 1
+        return caller
+
+    short_orbit = [
+        make_caller(
+            event_time=0.0,
+            source_type="initial_short_orbit",
+            attempt_count=1,
+            location="short_orbit",
+        )
+        for _ in range(params.rs0)
+    ]
+    long_orbit = [
+        make_caller(
+            event_time=0.0,
+            source_type="initial_long_orbit",
+            attempt_count=1,
+            location="long_orbit",
+        )
+        for _ in range(params.rl0)
+    ]
     # Up to c initial callers enter service immediately; the rest wait in queue.
     initial_in_service = min(params.q0, params.c)
     # in_service stores caller records for callers currently being served.
     in_service = [
-        Caller(queue_entry_time=0.0, service_start_time=0.0, attempt_count=0)
+        make_caller(
+            event_time=0.0,
+            source_type="initial",
+            attempt_count=0,
+            location="service",
+        )
         for _ in range(initial_in_service)
     ]
+    for caller in in_service:
+        caller.service_start_time = 0.0
     # waiting_queue is FIFO and stores caller records for callers waiting.
     waiting_queue = [
-        Caller(queue_entry_time=0.0, attempt_count=0)
+        make_caller(
+            event_time=0.0,
+            source_type="initial",
+            attempt_count=0,
+            location="queue",
+        )
         for _ in range(params.q0 - initial_in_service)
     ]
 
@@ -579,47 +794,52 @@ def simulate_one(
     # These min/max diagnostics help detect violations of state constraints.
     min_Q = params.q0
     min_B = B
-    min_RS = sum(short_orbit.values())
-    min_RL = sum(long_orbit.values())
+    min_RS = len(short_orbit)
+    min_RL = len(long_orbit)
     max_in_service = len(in_service)
     # Current simulation clock.
     t = 0.0
+    events_processed = 0
+    dynamic_stop_time: float | None = None
+    cohort_clearance_time: float | None = None
+    termination_reason = "fixed_horizon"
+    dynamic_horizon_success = False
     path_rows: list[dict[str, float | int]] = []
     if record_path:
         if record_dt is None:
-            record_dt = params.T / 500.0
+            record_dt = simulation_limit / 500.0
         if record_dt <= 0 or not math.isfinite(record_dt):
             raise ValueError("record_dt must be positive and finite")
         next_record_t = 0.0
     if params.arrival_process == "sinusoidal":
-        fresh_arrival_times = list(generate_arrival_times(params, params.T, rng))
+        fresh_arrival_times = list(generate_arrival_times(params, simulation_limit, rng))
     else:
         fresh_arrival_times = []
     next_fresh_index = 0
 
-    def orbit_count(orbit: Counter[int]) -> int:
+    def orbit_count(orbit: list[Caller]) -> int:
         """Return the number of callers currently held in an orbit."""
 
-        return int(sum(orbit.values()))
+        return len(orbit)
 
-    def pop_orbit_attempt_count(orbit: Counter[int]) -> int:
-        """Sample and remove one caller attempt-count bucket from an orbit.
+    def pop_orbit_caller(orbit: list[Caller], source_type: str) -> Caller:
+        """Sample and remove one caller from an orbit."""
 
-        TODO: This samples proportionally by attempt-count buckets because the
-        model has aggregate exponential return clocks for each orbit.
-        """
+        orbit_index = int(rng.integers(len(orbit)))
+        caller = orbit.pop(orbit_index)
+        caller.queue_entry_time = t
+        caller.service_start_time = None
+        caller.source_type = source_type
+        caller.current_location = "queue"
+        return caller
 
-        total = orbit_count(orbit)
-        draw = int(rng.integers(total))
-        cumulative = 0
-        for attempt_count in sorted(orbit):
-            cumulative += orbit[attempt_count]
-            if draw < cumulative:
-                orbit[attempt_count] -= 1
-                if orbit[attempt_count] == 0:
-                    del orbit[attempt_count]
-                return attempt_count
-        raise RuntimeError("failed to sample orbit attempt count")
+    def add_to_orbit(caller: Caller, orbit: list[Caller], location: str) -> None:
+        """Move a caller into an orbit after an unsuccessful call attempt."""
+
+        caller.attempt_count += 1
+        caller.service_start_time = None
+        caller.current_location = location
+        orbit.append(caller)
 
     def admit_caller(caller: Caller, event_time: float, collect: bool) -> None:
         """Put an arriving caller into service if possible, otherwise queue it.
@@ -632,10 +852,12 @@ def simulate_one(
 
         if len(in_service) < params.c:
             caller.service_start_time = event_time
+            caller.current_location = "service"
             in_service.append(caller)
             if collect:
                 answered_waits.append(event_time - caller.queue_entry_time)
         else:
+            caller.current_location = "queue"
             waiting_queue.append(caller)
 
     def start_next_waiting(event_time: float, collect: bool) -> None:
@@ -644,11 +866,31 @@ def simulate_one(
         if len(waiting_queue) > 0 and len(in_service) < params.c:
             caller = waiting_queue.pop(0)
             caller.service_start_time = event_time
+            caller.current_location = "service"
             in_service.append(caller)
             if collect:
                 answered_waits.append(event_time - caller.queue_entry_time)
 
-    while t < params.T:
+    def cohort_callers() -> list[Caller]:
+        """Return all callers whose first arrival lies in the cohort window."""
+
+        return [
+            caller
+            for caller in all_callers.values()
+            if caller.is_cohort_member(cohort_start, cohort_end)
+        ]
+
+    def unfinished_cohort_count() -> int:
+        """Return cohort callers without a terminal completion or exit time."""
+
+        return sum(
+            1
+            for caller in cohort_callers()
+            if caller.completion_time is None and caller.exit_time is None
+        )
+
+    while t < simulation_limit:
+        current_stop_time = dynamic_stop_time or simulation_limit
         # Current waiting and service counts determine all event rates in this step.
         n_waiting = len(waiting_queue)
         n_service = len(in_service)
@@ -698,7 +940,7 @@ def simulate_one(
             )
         # Exponential waiting times are the standard CTMC/Gillespie simulation step.
         endogenous_event_time = (
-            params.T
+            current_stop_time
             if total_rate == 0.0
             else t + rng.exponential(1.0 / total_rate)
         )
@@ -709,7 +951,7 @@ def simulate_one(
         )
         event_time = min(endogenous_event_time, next_fresh_time)
         # If the next event exceeds T, accumulate state integrals only up to T.
-        interval_end = min(event_time, params.T)
+        interval_end = min(event_time, current_stop_time)
         if record_path:
             while next_record_t <= interval_end:
                 path_rows.append(
@@ -739,18 +981,26 @@ def simulate_one(
             params.arrival_process == "sinusoidal"
             and next_fresh_index < len(fresh_arrival_times)
             and next_fresh_time <= endogenous_event_time
-            and next_fresh_time < params.T
+            and next_fresh_time < current_stop_time
         )
         endogenous_event_due = (
             endogenous_event_time <= next_fresh_time
-            and endogenous_event_time < params.T
+            and endogenous_event_time < current_stop_time
             and total_rate > 0.0
         )
         if not fresh_event_due and not endogenous_event_due:
-            t = params.T
+            t = current_stop_time
+            if dynamic_horizon:
+                if dynamic_stop_time is not None:
+                    termination_reason = "cohort_cleared_buffer_elapsed"
+                elif t >= simulation_limit:
+                    termination_reason = "max_dynamic_horizon"
+            else:
+                termination_reason = "fixed_horizon"
             break
 
         t = event_time
+        events_processed += 1
         # collect controls whether the current event enters post-warmup statistics.
         collect = t >= params.warmup
         if fresh_event_due:
@@ -764,33 +1014,35 @@ def simulate_one(
             # External fresh arrival enters the system without changing B, RS, or RL.
             if collect:
                 counts["fresh_arrivals"] += 1
-            admit_caller(Caller(queue_entry_time=t, attempt_count=0), t, collect)
+            admit_caller(
+                make_caller(event_time=t, source_type="fresh", attempt_count=0),
+                t,
+                collect,
+            )
         elif event == 1:  # Recertification arrival
             # One individual in B generates a recertification call and leaves B.
             B -= 1
             if collect:
                 counts["recertification_arrivals"] += 1
-            admit_caller(Caller(queue_entry_time=t, attempt_count=0), t, collect)
+            admit_caller(
+                make_caller(
+                    event_time=t, source_type="recertification", attempt_count=0
+                ),
+                t,
+                collect,
+            )
         elif event == 2:  # Short-redial arrival
             # One short-redial individual returns, leaves RS, and enters the system.
-            attempt_count = pop_orbit_attempt_count(short_orbit)
+            caller = pop_orbit_caller(short_orbit, "short_orbit_return")
             if collect:
                 counts["short_redial_arrivals"] += 1
-            admit_caller(
-                Caller(queue_entry_time=t, attempt_count=attempt_count + 1),
-                t,
-                collect,
-            )
+            admit_caller(caller, t, collect)
         elif event == 3:  # Long-redial arrival
             # One long-redial individual returns, leaves RL, and enters the system.
-            attempt_count = pop_orbit_attempt_count(long_orbit)
+            caller = pop_orbit_caller(long_orbit, "long_orbit_return")
             if collect:
                 counts["long_redial_arrivals"] += 1
-            admit_caller(
-                Caller(queue_entry_time=t, attempt_count=attempt_count + 1),
-                t,
-                collect,
-            )
+            admit_caller(caller, t, collect)
         elif event in (4, 5, 6):  # Waiting-caller abandonment
             # Waiting callers have identical clocks, so choose the abandoner uniformly.
             abandoned_index = int(rng.integers(len(waiting_queue)))
@@ -799,16 +1051,21 @@ def simulate_one(
                 abandoned_waits.append(t - caller.queue_entry_time)
             if event == 4:
                 # Lost abandonment: the caller does not enter any redial pool.
+                caller.attempt_count += 1
+                caller.exit_time = t
+                caller.current_location = "left_without_enrollment"
+                if caller.is_cohort_member(cohort_start, cohort_end):
+                    cohort_unfinished_live -= 1
                 if collect:
                     counts["abandon_lost"] += 1
             elif event == 5:
                 # Short redial: the caller may return later at aggregate rate deltaS * RS.
-                short_orbit[caller.attempt_count] += 1
+                add_to_orbit(caller, short_orbit, "short_orbit")
                 if collect:
                     counts["abandon_short"] += 1
             else:
                 # Long redial: the caller may return later at aggregate rate deltaL * RL.
-                long_orbit[caller.attempt_count] += 1
+                add_to_orbit(caller, long_orbit, "long_orbit")
                 if collect:
                     counts["abandon_long"] += 1
         elif event in (7, 8):  # Service completion
@@ -817,15 +1074,30 @@ def simulate_one(
             caller = in_service.pop(completed_index)
             if event == 7:
                 # Successful service: the individual enters B.
+                caller.completion_time = t
+                caller.current_location = "completed"
+                if caller.is_cohort_member(cohort_start, cohort_end):
+                    cohort_unfinished_live -= 1
+                completed_caller_records.append(
+                    {
+                        "caller_id": caller.caller_id,
+                        "first_arrival_time": float(caller.first_arrival_time),
+                        "completion_time": t,
+                        "time_to_enrollment": t - float(caller.first_arrival_time),
+                        "attempt_count": caller.attempt_count,
+                        "cohort_member": caller.is_cohort_member(
+                            cohort_start, cohort_end
+                        ),
+                    }
+                )
                 if collect:
                     completed_attempt_records.append(caller.attempt_count)
-                caller.attempt_count = 0
                 B += 1
                 if collect:
                     counts["service_successes"] += 1
             else:
                 # Failed service: the individual enters the long-redial pool RL.
-                long_orbit[caller.attempt_count] += 1
+                add_to_orbit(caller, long_orbit, "long_orbit")
                 if collect:
                     counts["service_failures"] += 1
             # When a server frees up, admit the next waiting caller under FCFS.
@@ -858,8 +1130,33 @@ def simulate_one(
                 require_positive_total_rate=False,
             )
 
+        if dynamic_horizon and max_events is not None and events_processed >= max_events:
+            termination_reason = "max_events"
+            break
+
+        if dynamic_horizon and dynamic_stop_time is None and t >= float(cohort_end):
+            if cohort_size_collected > 0 and cohort_unfinished_live == 0:
+                cohort_clearance_time = t
+                dynamic_stop_time = min(t + post_clearance_buffer, simulation_limit)
+
     # Observation time used for averages and rates, excluding warmup.
-    observation_time = params.T - params.warmup
+    simulation_end_time = t
+    if dynamic_horizon:
+        if cohort_size_collected == 0 and termination_reason != "max_events":
+            termination_reason = "zero_cohort"
+        elif termination_reason == "fixed_horizon":
+            if cohort_size_collected == 0:
+                termination_reason = "zero_cohort"
+            elif cohort_unfinished_live > 0:
+                termination_reason = "max_dynamic_horizon"
+            else:
+                termination_reason = "cohort_cleared_buffer_elapsed"
+        dynamic_horizon_success = (
+            termination_reason == "cohort_cleared_buffer_elapsed"
+            and cohort_size_collected > 0
+            and cohort_unfinished_live == 0
+        )
+    observation_time = max(simulation_end_time - params.warmup, 0.0)
     # Total arrivals are the four event types that enter the system.
     total_arrivals = sum(
         counts[name]
@@ -950,14 +1247,215 @@ def simulate_one(
         **repeat_attempt_proxies,
         **attempt_summary,
     )
-    if record_path:
-        path = pd.DataFrame(path_rows, columns=["t", "Q", "B", "RS", "RL"])
-        if return_attempt_records:
-            return result, completed_attempt_records, path
-        return result, path
+
+    def end_state_distribution(only_cohort: bool = False) -> pd.DataFrame:
+        """Return attempt-count distributions for callers still in tracked states."""
+
+        location_callers = {
+            "queue": waiting_queue,
+            "service": in_service,
+            "short_orbit": short_orbit,
+            "long_orbit": long_orbit,
+        }
+        rows = []
+        for location, callers in location_callers.items():
+            selected = [
+                caller
+                for caller in callers
+                if not only_cohort
+                or caller.is_cohort_member(cohort_start, cohort_end)
+            ]
+            counts_by_attempt = Counter(caller.attempt_count for caller in selected)
+            for attempt_count, count in sorted(counts_by_attempt.items()):
+                rows.append(
+                    {
+                        "location": location,
+                        "attempt_count": int(attempt_count),
+                        "count": int(count),
+                    }
+                )
+        return pd.DataFrame(rows, columns=["location", "attempt_count", "count"])
+
+    caller_records = pd.DataFrame(
+        completed_caller_records,
+        columns=[
+            "caller_id",
+            "first_arrival_time",
+            "completion_time",
+            "time_to_enrollment",
+            "attempt_count",
+            "cohort_member",
+        ],
+    )
+
+    def caller_state_row(caller: Caller) -> dict[str, int | float | str | bool | None]:
+        """Return a person-level final state row for cohort analysis."""
+
+        if caller.completion_time is not None:
+            terminal_outcome = "completed"
+            end_time = caller.completion_time
+        elif caller.exit_time is not None:
+            terminal_outcome = "left_without_enrollment"
+            end_time = caller.exit_time
+        else:
+            terminal_outcome = "unfinished"
+            end_time = simulation_end_time
+        return {
+            "caller_id": caller.caller_id,
+            "first_arrival_time": float(caller.first_arrival_time),
+            "service_start_time": caller.service_start_time,
+            "completion_time": caller.completion_time,
+            "exit_time": caller.exit_time,
+            "attempt_count": caller.attempt_count,
+            "current_location": caller.current_location,
+            "terminal_outcome": terminal_outcome,
+            "time_in_system": end_time - float(caller.first_arrival_time),
+            "is_cohort_member": caller.is_cohort_member(cohort_start, cohort_end),
+        }
+
+    cohort_caller_state_records = pd.DataFrame(
+        [
+            caller_state_row(caller)
+            for caller in all_callers.values()
+            if caller.is_cohort_member(cohort_start, cohort_end)
+        ],
+        columns=[
+            "caller_id",
+            "first_arrival_time",
+            "service_start_time",
+            "completion_time",
+            "exit_time",
+            "attempt_count",
+            "current_location",
+            "terminal_outcome",
+            "time_in_system",
+            "is_cohort_member",
+        ],
+    )
+    unfinished_rows = []
+    for caller in all_callers.values():
+        if (
+            caller.completion_time is None
+            and caller.is_cohort_member(cohort_start, cohort_end)
+        ):
+            end_time = (
+                caller.exit_time if caller.exit_time is not None else simulation_end_time
+            )
+            unfinished_rows.append(
+                {
+                    "caller_id": caller.caller_id,
+                    "first_arrival_time": float(caller.first_arrival_time),
+                    "current_attempt_count": caller.attempt_count,
+                    "current_location": caller.current_location,
+                    "time_in_system": end_time - float(caller.first_arrival_time),
+                }
+            )
+    unfinished_cohort_callers = pd.DataFrame(
+        unfinished_rows,
+        columns=[
+            "caller_id",
+            "first_arrival_time",
+            "current_attempt_count",
+            "current_location",
+            "time_in_system",
+        ],
+    )
+
+    cohort_size = int(len(cohort_caller_state_records))
+    cohort_completed = int(
+        (cohort_caller_state_records["terminal_outcome"] == "completed").sum()
+    )
+    cohort_left_without_enrollment = int(
+        (
+            cohort_caller_state_records["terminal_outcome"]
+            == "left_without_enrollment"
+        ).sum()
+    )
+    cohort_unfinished = int(
+        (cohort_caller_state_records["terminal_outcome"] == "unfinished").sum()
+    )
+    dynamic_horizon_diagnostics = pd.DataFrame(
+        [
+            {
+                "cohort_start": cohort_start,
+                "cohort_end": cohort_end,
+                "cohort_size": cohort_size,
+                "cohort_completed": cohort_completed,
+                "cohort_left_without_enrollment": cohort_left_without_enrollment,
+                "cohort_unfinished": cohort_unfinished,
+                "cohort_clearance_time": cohort_clearance_time,
+                "post_clearance_buffer": post_clearance_buffer
+                if dynamic_horizon
+                else float("nan"),
+                "simulation_end_time": simulation_end_time,
+                "dynamic_horizon_success": dynamic_horizon_success,
+                "events_processed": events_processed,
+                "termination_reason": termination_reason,
+            }
+        ]
+    )
+
+    extras_requested = (
+        return_caller_records
+        or return_end_state_distribution
+        or return_cohort_summary
+        or dynamic_horizon
+    )
+    # extra_outputs holds the new analysis tables requested by caller-level flags.
+    # It is appended as the final tuple item so older return modes keep their order.
+    extra_outputs: dict[str, pd.DataFrame] = {}
+    if return_caller_records:
+        # caller_records: one row per successful enrollment.
+        # unfinished_cohort_callers: cohort callers without successful enrollment by T.
+        extra_outputs["caller_records"] = caller_records
+        extra_outputs["cohort_caller_state_records"] = cohort_caller_state_records
+        extra_outputs["unfinished_cohort_callers"] = unfinished_cohort_callers
+    if return_end_state_distribution:
+        # end_state_attempt_distribution summarizes active callers still in
+        # queue/service/orbits at T; the cohort version filters that table to
+        # callers whose first arrival time lies in [cohort_start, cohort_end).
+        extra_outputs["end_state_attempt_distribution"] = end_state_distribution()
+        extra_outputs["cohort_end_state_attempt_distribution"] = (
+            end_state_distribution(only_cohort=True)
+        )
+    if return_cohort_summary:
+        # cohort_summary is a one-row table with cohort size, completion rate,
+        # and attempt/time-to-enrollment summary statistics.
+        extra_outputs["cohort_summary"] = cohort_summary_table(
+            caller_records,
+            unfinished_cohort_callers,
+            cohort_start=cohort_start,
+            cohort_end=cohort_end,
+            horizon=simulation_end_time,
+        )
+    if dynamic_horizon:
+        extra_outputs["dynamic_horizon_diagnostics"] = dynamic_horizon_diagnostics
+
+    # Preserve the historical return contract:
+    #   simulate_one(...) -> result
+    #   return_attempt_records=True -> (result, completed_attempt_records)
+    #   record_path=True -> (result, path)
+    #   both old flags -> (result, completed_attempt_records, path)
+    # New caller/cohort outputs are appended after those legacy outputs.
+    outputs: list[object] = [result]
     if return_attempt_records:
-        return result, completed_attempt_records
-    return result
+        # completed_attempt_records is the legacy list of attempt counts for
+        # post-warmup successful enrollments.
+        outputs.append(completed_attempt_records)
+    if record_path:
+        # path is the aggregate sample path of Q, B, RS, and RL over time.
+        path = pd.DataFrame(path_rows, columns=["t", "Q", "B", "RS", "RL"])
+        outputs.append(path)
+    if extras_requested:
+        # Include these base caller tables whenever any new extra is requested,
+        # so downstream analysis can audit the summary tables if needed.
+        extra_outputs.setdefault("caller_records", caller_records)
+        extra_outputs.setdefault("cohort_caller_state_records", cohort_caller_state_records)
+        extra_outputs.setdefault("unfinished_cohort_callers", unfinished_cohort_callers)
+        outputs.append(extra_outputs)
+    if len(outputs) == 1:
+        return result
+    return tuple(outputs)
 
 
 def run_replications(
