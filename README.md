@@ -116,10 +116,6 @@ Supporting code is grouped by purpose:
 - `tests/`: pytest test suite
 - `outputs/`: generated tables, plots, caches, and reports
 
-Validation scripts now live under `scripts/validation/`, but root-level
-compatibility wrappers are kept so older commands such as
-`python compare_light_vs_fluid.py` continue to work.
-
 Run validation scripts directly with module paths, for example:
 
 ```bash
