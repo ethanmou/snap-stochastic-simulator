@@ -165,7 +165,7 @@ def test_attempt_distribution_summary_zero_fills_missing_categories():
 
 
 def test_policy_construction_changes_only_intended_capacity_parameters():
-    row = load_call_center_parameters("call center parameters.csv", 2)
+    row = load_call_center_parameters("data/call_center_parameters.csv", 2)
     scenarios = build_policy_scenarios(row, seed=1, horizon=10.0, warmup=1.0)
 
     assert scenarios["baseline"].c == 52

@@ -12,6 +12,9 @@ dependencies = [
     "numpy",
     "pandas",
     "matplotlib",
+    "streamlit",
+    "plotly",
+    "scipy",
 ]
 
 [project.optional-dependencies]
@@ -21,6 +24,7 @@ dev = [
 
 [tool.setuptools]
 py-modules = ["stochastic_simulation", "light_simulation", "fluid_steady_state"]
+packages = ["apps", "configs", "dashboard", "experiments", "scripts", "scripts.validation"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

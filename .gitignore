@@ -27,6 +27,10 @@ dist/
 
 # Generated reports and data dumps
 *.csv
+!data/
+!data/*.csv
+!data/parameter_sample/
+!data/parameter_sample/*.csv
 !outputs/
 !outputs/*.csv
 !outputs/weekly_research/
@@ -38,6 +42,12 @@ outputs/weekly_research/.matplotlib/
 !outputs/nonstationary_attempts/*.csv
 !outputs/nonstationary_attempts/*.png
 outputs/nonstationary_attempts/.matplotlib/
+outputs/cohort_caller/
+outputs/cohort_policy_analysis/
+outputs/dashboard_policy_cache/
+outputs/dashboard_queue_cache/
+outputs/figures/
+outputs/research_stage_policy_report/
 *.xlsx
 *.parquet
 *.pkl

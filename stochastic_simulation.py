@@ -639,6 +639,10 @@ def simulate_one(
     max_events: int | None = None,
     record_path: bool = False,
     record_dt: float | None = None,
+    queue_distribution_enabled: bool = False,
+    queue_warmup_time: float | None = None,
+    queue_sample_interval: float | None = None,
+    queue_observation_end: float | None = None,
 ) -> (
     SimulationResult
     | tuple[SimulationResult, list[int]]
@@ -651,6 +655,8 @@ def simulate_one(
     Queue service is FCFS, while abandonment selects a uniformly random waiting
     caller, as implied by identical exponential abandonment clocks.
     Set ``validate=True`` to run invariant checks during the event loop.
+    ``queue_distribution_enabled`` records fixed-clock samples of the main
+    waiting queue length without adding events or consuming random numbers.
     """
 
     _validate_params(params)
@@ -683,6 +689,40 @@ def simulate_one(
         if dynamic_horizon and max_dynamic_horizon is not None
         else float(params.T)
     )
+    path_recording_enabled = record_path or queue_distribution_enabled
+    if queue_distribution_enabled:
+        if queue_warmup_time is None:
+            queue_warmup_time = params.warmup
+        if queue_sample_interval is None:
+            queue_sample_interval = record_dt
+        if queue_sample_interval is None:
+            raise ValueError(
+                "queue_sample_interval must be provided when queue distribution recording is enabled"
+            )
+        if not math.isfinite(queue_warmup_time) or queue_warmup_time < 0:
+            raise ValueError("queue_warmup_time must be finite and nonnegative")
+        if not math.isfinite(queue_sample_interval) or queue_sample_interval <= 0:
+            raise ValueError("queue_sample_interval must be positive and finite")
+        if queue_observation_end is None:
+            queue_observation_end = simulation_limit
+        if not math.isfinite(queue_observation_end):
+            raise ValueError("queue_observation_end must be finite when provided")
+        if queue_observation_end < queue_warmup_time:
+            raise ValueError(
+                "queue_observation_end must be greater than or equal to queue_warmup_time"
+            )
+        if queue_observation_end > simulation_limit:
+            raise ValueError("queue_observation_end cannot exceed the simulation horizon")
+        record_dt = float(queue_sample_interval)
+        next_record_t = float(queue_warmup_time)
+        record_end_t = float(queue_observation_end)
+    elif record_path:
+        if record_dt is None:
+            record_dt = simulation_limit / 500.0
+        if record_dt <= 0 or not math.isfinite(record_dt):
+            raise ValueError("record_dt must be positive and finite")
+        next_record_t = 0.0
+        record_end_t = simulation_limit
     # NumPy's Generator is the model's only randomness source, aiding reproducibility.
     rng = np.random.default_rng(params.seed)
 
@@ -805,12 +845,6 @@ def simulate_one(
     termination_reason = "fixed_horizon"
     dynamic_horizon_success = False
     path_rows: list[dict[str, float | int]] = []
-    if record_path:
-        if record_dt is None:
-            record_dt = simulation_limit / 500.0
-        if record_dt <= 0 or not math.isfinite(record_dt):
-            raise ValueError("record_dt must be positive and finite")
-        next_record_t = 0.0
     if params.arrival_process == "sinusoidal":
         fresh_arrival_times = list(generate_arrival_times(params, simulation_limit, rng))
     else:
@@ -952,12 +986,13 @@ def simulate_one(
         event_time = min(endogenous_event_time, next_fresh_time)
         # If the next event exceeds T, accumulate state integrals only up to T.
         interval_end = min(event_time, current_stop_time)
-        if record_path:
-            while next_record_t <= interval_end:
+        if path_recording_enabled:
+            while next_record_t <= min(interval_end, record_end_t):
                 path_rows.append(
                     {
                         "t": next_record_t,
                         "Q": n_waiting + n_service,
+                        "waiting": n_waiting,
                         "B": B,
                         "RS": RS,
                         "RL": RL,
@@ -1050,8 +1085,8 @@ def simulate_one(
             if collect:
                 abandoned_waits.append(t - caller.queue_entry_time)
             if event == 4:
-                # Lost abandonment: the caller does not enter any redial pool.
-                caller.attempt_count += 1
+                # Lost abandonment terminates the current attempt. attempt_count
+                # records only failed nonterminal attempts before the terminal outcome.
                 caller.exit_time = t
                 caller.current_location = "left_without_enrollment"
                 if caller.is_cohort_member(cohort_start, cohort_end):
@@ -1434,7 +1469,7 @@ def simulate_one(
     # Preserve the historical return contract:
     #   simulate_one(...) -> result
     #   return_attempt_records=True -> (result, completed_attempt_records)
-    #   record_path=True -> (result, path)
+    #   record_path=True or queue_distribution_enabled=True -> (result, path)
     #   both old flags -> (result, completed_attempt_records, path)
     # New caller/cohort outputs are appended after those legacy outputs.
     outputs: list[object] = [result]
@@ -1442,9 +1477,10 @@ def simulate_one(
         # completed_attempt_records is the legacy list of attempt counts for
         # post-warmup successful enrollments.
         outputs.append(completed_attempt_records)
-    if record_path:
-        # path is the aggregate sample path of Q, B, RS, and RL over time.
-        path = pd.DataFrame(path_rows, columns=["t", "Q", "B", "RS", "RL"])
+    if path_recording_enabled:
+        # path is sampled at fixed simulation-clock times. Q is total callers
+        # in service plus waiting; waiting is the main service queue length.
+        path = pd.DataFrame(path_rows, columns=["t", "Q", "waiting", "B", "RS", "RL"])
         outputs.append(path)
     if extras_requested:
         # Include these base caller tables whenever any new extra is requested,

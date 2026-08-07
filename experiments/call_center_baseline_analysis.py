@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--parameter-file", default="call center parameters.csv")
+    parser.add_argument("--parameter-file", default="data/call_center_parameters.csv")
     parser.add_argument("--call-centers", default="2,3,4")
     parser.add_argument("--cohort-start", type=float, default=260.0)
     parser.add_argument("--cohort-end", type=float, default=420.0)

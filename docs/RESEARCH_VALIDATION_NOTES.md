@@ -44,7 +44,7 @@ detailed metrics remain the responsibility of the full stochastic simulator.
 Run:
 
 ```bash
-.venv/bin/python compare_full_vs_light.py
+.venv/bin/python -m scripts.validation.compare_full_vs_light
 ```
 
 This writes:
@@ -73,7 +73,7 @@ simulator intentionally does not retain per-caller queue entry records.
 Run:
 
 ```bash
-.venv/bin/python compare_long_vs_many_replications.py
+.venv/bin/python -m scripts.validation.compare_long_vs_many_replications
 ```
 
 This writes:
@@ -102,7 +102,7 @@ abandonment rates, service completion rates, or procedural denial rates.
 Run:
 
 ```bash
-.venv/bin/python compare_light_vs_fluid.py
+.venv/bin/python -m scripts.validation.compare_light_vs_fluid
 ```
 
 This writes:
@@ -137,7 +137,7 @@ assumptions justify that interpretation.
 ## Fluid Benchmark Status
 
 Fluid and steady-state benchmarking is now implemented in `fluid_steady_state.py`
-using the Section 4.1 formulas from the paper. See `FLUID_BENCHMARK_NOTES.md`
+using the Section 4.1 formulas from the paper. See `docs/FLUID_BENCHMARK_NOTES.md`
 for the equations, metric interpretation, and light-vs-fluid comparison command.
 
 ## Tests

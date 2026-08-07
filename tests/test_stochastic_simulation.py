@@ -4,9 +4,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from compare_full_vs_light import CORE_METRICS
-from compare_light_vs_fluid import build_comparison as build_light_vs_fluid
-from compare_long_vs_many_replications import METRICS as LONG_VS_MANY_METRICS
+from scripts.validation.compare_full_vs_light import CORE_METRICS
+from scripts.validation.compare_light_vs_fluid import (
+    build_comparison as build_light_vs_fluid,
+)
+from scripts.validation.compare_long_vs_many_replications import (
+    METRICS as LONG_VS_MANY_METRICS,
+)
 from configs.paper_cc2_baseline import BASELINE, default_initial_state
 from configs.paper_cc2_baseline import make_baseline_params
 from configs.paper_cc2_baseline import PaperCC2Baseline
@@ -205,6 +209,26 @@ def test_light_simulator_records_aggregate_path():
     assert path[["Q", "B", "RS", "RL"]].ge(0).all().all()
 
 
+def test_queue_distribution_sampling_preserves_simulation_result():
+    params = make_params(T=3.0, warmup=0.5, q0=12, c=4, seed=20260728)
+
+    plain = simulate_one(params)
+    recorded, path = simulate_one(
+        params,
+        queue_distribution_enabled=True,
+        queue_warmup_time=1.0,
+        queue_sample_interval=0.5,
+        queue_observation_end=2.0,
+    )
+
+    assert asdict(recorded) == asdict(plain)
+    assert list(path.columns) == ["t", "Q", "waiting", "B", "RS", "RL"]
+    assert path["t"].tolist() == pytest.approx([1.0, 1.5, 2.0])
+    assert path["waiting"].ge(0).all()
+    assert path["waiting"].le(path["Q"]).all()
+    assert (path["Q"] - path["waiting"]).le(params.c).all()
+
+
 def test_event_sampling_stays_in_range():
     rng = np.random.default_rng(2026)
     rates = np.array([0.0, 2.0, 0.0, 3.0, 5.0])
@@ -395,6 +419,45 @@ def test_caller_level_records_satisfy_cohort_invariants():
         ).all()
     if total > 0:
         assert summary["cohort_completion_rate"] == pytest.approx(completed / total)
+
+
+def test_final_abandonment_does_not_increment_nonterminal_attempt_count():
+    params = make_params(
+        T=10.0,
+        warmup=0.0,
+        c=0,
+        lam=0.0,
+        mu_plus=0.0,
+        mu_minus=0.0,
+        thetaA=10.0,
+        thetaS=0.0,
+        thetaL=0.0,
+        deltaB=0.0,
+        deltaS=0.0,
+        deltaL=0.0,
+        gamma=0.0,
+        q0=1,
+        b0=0,
+        rs0=0,
+        rl0=0,
+        seed=20260729,
+    )
+
+    result, extras = simulate_one(
+        params,
+        validate=True,
+        return_caller_records=True,
+        cohort_start=0.0,
+        cohort_end=1.0,
+    )
+
+    cohort_records = extras["cohort_caller_state_records"]
+    abandoned = cohort_records[
+        cohort_records["terminal_outcome"] == "left_without_enrollment"
+    ]
+    assert result.abandon_lost == 1
+    assert len(abandoned) == 1
+    assert int(abandoned.iloc[0]["attempt_count"]) == 0
 
 
 def test_end_state_attempt_distribution_counts_current_callers():

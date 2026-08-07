@@ -47,7 +47,7 @@ Those metrics remain the responsibility of the full stochastic simulator.
 ## Run The Comparison
 
 ```bash
-.venv/bin/python compare_light_vs_fluid.py
+.venv/bin/python -m scripts.validation.compare_light_vs_fluid
 ```
 
 The script compares 100 light Gillespie replications against the deterministic
